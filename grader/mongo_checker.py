@@ -1,0 +1,289 @@
+from __future__ import annotations
+import re
+from dataclasses import dataclass, asdict
+from typing import Any
+
+BUSINESS_KEY_ALIASES = ('order_id', 'id_order', 'record_clean.order_id', 'record_clean.id_order')
+ROW_ALIASES = ('source_row_number', 'number_row_source', 'row_number', 'csv_row_number')
+ENGINE_ALIASES = ('engine_used', 'used_engine', 'engine', 'processing_engine')
+
+@dataclass
+class MongoSnapshot:
+    raw: int
+    validated: int
+    quarantine: int
+    duplicate_business_keys: int
+    business_key: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+class MongoChecker:
+    def __init__(self, uri: str, database: str, collections: dict[str, str], business_key: str = 'order_id'):
+        from pymongo import MongoClient
+        self.client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        self.database_name = database
+        self.db = self.client[database]
+        self.collections = collections
+        self.business_key = business_key or 'order_id'
+
+    def locate_active_database(self) -> tuple[str | None, list[str]]:
+        """Find a unique database with actual pipeline data in this isolated Mongo instance.
+
+        Never guess among multiple populated databases or count an empty setup
+        collection as evidence that the pipeline wrote to that database.
+        """
+        candidates = []
+        evidence = []
+        for name in self.client.list_database_names():
+            if name in {"admin", "config", "local"}:
+                continue
+            db = self.client[name]
+            names = set(db.list_collection_names())
+            matches = [coll for coll in self.collections.values() if coll in names]
+            if not matches:
+                continue
+            counts = {coll: db[coll].count_documents({}) for coll in matches}
+            if sum(counts.values()) > 0:
+                candidates.append(name)
+                evidence.append(f"{name}: {counts}")
+        return (candidates[0] if len(candidates) == 1 else None), evidence
+
+    def find_unambiguous_empty_unique_index_database(
+        self, *, allow_partial_failed_attempt: bool = False
+    ) -> tuple[str | None, list[str]]:
+        """Locate the *one* empty project database carrying a unique business-key index.
+
+        Only the isolated MongoDB instance attached to this student sandbox is
+        inspected. A nonempty database is eligible only when explicitly
+        requested for a failed first attempt: its row counts must be captured
+        before reset so its evidence is not lost. Never guess between multiple
+        candidate databases. Never use this locator outside the sandbox.
+        """
+        candidates: list[str] = []
+        notes: list[str] = []
+        valid = self.collections.get("validated")
+        if not valid:
+            return None, ["missing validated collection mapping"]
+        allowed_keys = {self.business_key, *BUSINESS_KEY_ALIASES}
+        for dbname in self.client.list_database_names():
+            if dbname in {"admin", "config", "local"}:
+                continue
+            db = self.client[dbname]
+            existing = set(db.list_collection_names())
+            if valid not in existing:
+                continue
+            present = sorted(set(self.collections.values()) & existing)
+            counts = {c: db[c].count_documents({}) for c in present}
+            if any(counts.values()):
+                if not allow_partial_failed_attempt:
+                    notes.append(f"{dbname}: project data present, refusing reset")
+                    continue
+                notes.append(f"{dbname}: partial output from failed stage: {counts}")
+            try:
+                indexes = list(db[valid].list_indexes())
+            except Exception as exc:
+                notes.append(f"{dbname}: cannot inspect indexes: {type(exc).__name__}")
+                continue
+            matches = [
+                str(idx.get("name") or "")
+                for idx in indexes
+                if idx.get("unique")
+                and any(k in allowed_keys for k in (idx.get("key") or {}).keys())
+            ]
+            if matches:
+                candidates.append(dbname)
+                notes.append(f"{dbname}: empty with unique business-key index {matches}")
+        if len(candidates) != 1:
+            notes.append(f"candidate_database_count={len(candidates)}; no automatic reset")
+            return None, notes
+        return candidates[0], notes
+
+    def switch_database(self, name: str) -> None:
+        if not name or name in {"admin", "config", "local"}:
+            raise ValueError("Invalid student database")
+        self.database_name = name
+        self.db = self.client[name]
+
+    def close(self):
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
+    def ping(self) -> bool:
+        self.client.admin.command('ping')
+        return True
+
+    def drop_database(self):
+        self.client.drop_database(self.database_name)
+        self.db = self.client[self.database_name]
+
+    def clear_documents(self):
+        for name in self.collections.values():
+            if name in self.db.list_collection_names():
+                self.db[name].delete_many({})
+
+    def reset(self, preserve_schema: bool = True):
+        if preserve_schema:
+            self.clear_documents()
+        else:
+            self.drop_database()
+
+    def counts(self) -> dict[str, int]:
+        names = set(self.db.list_collection_names())
+        return {
+            k: (self.db[v].count_documents({}) if v in names else 0)
+            for k, v in self.collections.items()
+        }
+
+    def _existing_business_key(self) -> str:
+        col_name = self.collections['validated']
+        if col_name not in self.db.list_collection_names():
+            return self.business_key
+        col = self.db[col_name]
+        for candidate in [self.business_key, *BUSINESS_KEY_ALIASES]:
+            try:
+                if col.find_one({candidate: {'$exists': True, '$ne': None}}, {candidate: 1}):
+                    return candidate
+            except Exception:
+                continue
+        # Indexes are another strong signal even if collection is empty.
+        try:
+            for idx in col.list_indexes():
+                keys = list((idx.get('key') or {}).keys())
+                for candidate in [self.business_key, *BUSINESS_KEY_ALIASES]:
+                    if candidate in keys:
+                        return candidate
+        except Exception:
+            pass
+        return self.business_key
+
+    def duplicate_count(self) -> tuple[int, str]:
+        col_name = self.collections['validated']
+        if col_name not in self.db.list_collection_names():
+            return 0, self.business_key
+        key = self._existing_business_key()
+        col = self.db[col_name]
+        pipeline = [
+            {'$match': {key: {'$exists': True, '$ne': None}}},
+            {'$group': {'_id': f'${key}', 'n': {'$sum': 1}}},
+            {'$match': {'n': {'$gt': 1}}},
+            {'$count': 'groups'},
+        ]
+        docs = list(col.aggregate(pipeline, allowDiskUse=True))
+        return (docs[0]['groups'] if docs else 0), key
+
+    def indexes(self, collection_key: str = 'validated') -> list[dict[str, Any]]:
+        name = self.collections[collection_key]
+        if name not in self.db.list_collection_names():
+            return []
+        return [dict(x) for x in self.db[name].list_indexes()]
+
+    def has_unique_business_index(self) -> tuple[bool, list[str]]:
+        evidence = []
+        candidates = {self.business_key, *BUSINESS_KEY_ALIASES}
+        for idx in self.indexes('validated'):
+            keys = list((idx.get('key') or {}).keys())
+            if idx.get('unique') and any(k in candidates for k in keys):
+                evidence.append(f"{idx.get('name')}: {keys}")
+        return bool(evidence), evidence
+
+    def validator(self, collection_key: str = 'validated') -> dict[str, Any] | None:
+        name = self.collections[collection_key]
+        try:
+            result = self.db.command({'listCollections': 1, 'filter': {'name': name}})
+            batch = result.get('cursor', {}).get('firstBatch', [])
+            if not batch:
+                return None
+            options = batch[0].get('options', {})
+            return options.get('validator')
+        except Exception:
+            return None
+
+    def has_json_schema_validator(self) -> bool:
+        v = self.validator('validated') or {}
+        return '$jsonSchema' in v or any('$jsonSchema' in (x if isinstance(x, dict) else {}) for x in v.get('$and', []))
+
+    _AUDIT_COLLECTION_HINT = re.compile(r'(audit|correction|change|history|log|trail|fix)', re.I)
+    _AUDIT_KEY_FIELDS = ('order_id', 'id_order', 'orderId', 'business_key', 'record_id', 'entity_id',
+                         'document_id', 'doc_id', 'key', 'record_key', 'original_order_id')
+
+    def external_audit(self, order_id: str) -> bool:
+        """True when a correction/audit collection of this database holds an entry for the order.
+
+        An audit trail kept in its own collection (linked by business key) is as valid as one
+        embedded in the validated document.
+        """
+        try:
+            if not hasattr(self, '_audit_collections'):
+                own = set(self.collections.values())
+                self._audit_collections = [
+                    n for n in self.db.list_collection_names()
+                    if n not in own and not n.startswith('system.') and self._AUDIT_COLLECTION_HINT.search(n)
+                    and not re.search(r'(job|schedul|run_log|execution|metric|result|report)', n, re.I)
+                ]
+            for name in self._audit_collections:
+                clauses = [{k: order_id} for k in self._AUDIT_KEY_FIELDS]
+                clauses += [{f'record.{k}': order_id} for k in ('order_id', 'id_order')]
+                if self.db[name].find_one({'$or': clauses}, {'_id': 1}) is not None:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def find_validated(self, order_id: str) -> dict[str, Any] | None:
+        """Locate a validated record by business key, tolerating common student schemas."""
+        name = self.collections['validated']
+        if name not in self.db.list_collection_names():
+            return None
+        col = self.db[name]
+        keys = [self.business_key, 'order_id', 'id_order', 'orderId', 'orderid']
+        wrappers = ['', 'record_clean.', 'record.', 'clean_record.', 'cleaned_record.', 'data.', 'payload.',
+                    'document.', 'fields.', 'order.', 'cleaned.', 'clean.', 'normalized.']
+        clauses: list[dict[str, Any]] = []
+        for w in wrappers:
+            for k in dict.fromkeys(keys):
+                clauses.append({f'{w}{k}': order_id})
+        clauses.append({'_id': order_id})
+        doc = col.find_one({'$or': clauses})
+        if doc is not None:
+            return doc
+        # Last resort: a student may have normalised the id prefix (e.g. "ORD-714670" vs "714670").
+        digits = re.sub(r'\D', '', str(order_id))
+        if len(digits) >= 4:
+            pattern = {'$regex': f'(^|[^0-9]){digits}$'}
+            rx = [{f'{w}{k}': pattern} for w in wrappers[:3] for k in dict.fromkeys(keys)]
+            return col.find_one({'$or': rx})
+        return None
+
+    def find_raw_by_row(self, data_row_number: int) -> dict[str, Any] | None:
+        name = self.collections['raw']
+        if name not in self.db.list_collection_names():
+            return None
+        values = {data_row_number, data_row_number + 1}
+        clauses = [{field: {'$in': list(values)}} for field in ROW_ALIASES]
+        return self.db[name].find_one({'$or': clauses})
+
+    def sample_docs(self, collection_key: str, n: int = 20) -> list[dict[str, Any]]:
+        name = self.collections[collection_key]
+        if name not in self.db.list_collection_names():
+            return []
+        return list(self.db[name].find({}).limit(n))
+
+    def distinct_engine_values(self, n: int = 100) -> list[str]:
+        name = self.collections['raw']
+        if name not in self.db.list_collection_names():
+            return []
+        col = self.db[name]
+        values: set[str] = set()
+        for doc in col.find({}).limit(n):
+            for field in ENGINE_ALIASES:
+                if doc.get(field) is not None:
+                    values.add(str(doc[field]))
+        return sorted(values)
+
+    def snapshot(self) -> MongoSnapshot:
+        c = self.counts()
+        dup, key = self.duplicate_count()
+        return MongoSnapshot(c.get('raw', 0), c.get('validated', 0), c.get('quarantine', 0), dup, key)
